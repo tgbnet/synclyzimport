@@ -23,6 +23,10 @@ $configPath = $rootDir . DIRECTORY_SEPARATOR . CONFIG_FILE;
 $messages = [];
 $errors = [];
 session_start();
+if (!headers_sent()) {
+    header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+    header('Pragma: no-cache');
+}
 
 function h(string $value): string
 {
