@@ -12,6 +12,7 @@ declare(strict_types=1);
 const CONFIG_FILE = '.sitemap_setup_config.php';
 const SITEMAP_FILE = 'sitemap.xml';
 const ROOT_FILE = 'root.txt';
+const SEO_REPORT_FILE = 'seo-pages.txt';
 const REFRESH_SECONDS = 43200; // 12 hours
 const MAX_SITEMAP_URLS = 50000; // Google sitemap limit
 const MAX_SITEMAP_BYTES = 52428800; // 50MB uncompressed Google sitemap limit
@@ -101,84 +102,216 @@ function same_site_url(string $url, string $siteUrl): bool
     return $urlHost !== '' && $siteHost !== '' && $urlHost === $siteHost;
 }
 
-function canonical_url_for_file(string $filePath, string $fallbackUrl, string $siteUrl): string
+function normalize_crawled_url(string $url, string $siteUrl): string
 {
-    $extension = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
-    if (!in_array($extension, ['html', 'htm', 'php'], true) || !is_readable($filePath)) {
-        return $fallbackUrl;
+    $url = trim(html_entity_decode($url, ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+    if ($url === '' || str_starts_with($url, '#') || preg_match('~^(mailto|tel|javascript):~i', $url)) {
+        return '';
     }
 
-    $handle = fopen($filePath, 'rb');
-    if ($handle === false) {
-        return $fallbackUrl;
-    }
-    $html = fread($handle, 262144) ?: '';
-    fclose($handle);
-
-    if (!preg_match('~<link\s+[^>]*rel=["\']?canonical["\']?[^>]*>~i', $html, $tag)) {
-        return $fallbackUrl;
-    }
-    if (!preg_match('~href=["\']([^"\']+)["\']~i', $tag[0], $href)) {
-        return $fallbackUrl;
+    $base = parse_url($siteUrl);
+    if (str_starts_with($url, '//')) {
+        $url = ($base['scheme'] ?? 'https') . ':' . $url;
+    } elseif (str_starts_with($url, '/')) {
+        $url = ($base['scheme'] ?? 'https') . '://' . ($base['host'] ?? '') . $url;
+    } elseif (!preg_match('~^https?://~i', $url)) {
+        $basePath = rtrim(dirname((string)($base['path'] ?? '/')), '/');
+        $url = ($base['scheme'] ?? 'https') . '://' . ($base['host'] ?? '') . ($basePath === '' ? '' : $basePath) . '/' . $url;
     }
 
-    $canonical = html_entity_decode(trim($href[1]), ENT_QUOTES | ENT_HTML5, 'UTF-8');
-    if ($canonical === '' || !preg_match('~^https?://~i', $canonical) || !same_site_url($canonical, $siteUrl)) {
-        return $fallbackUrl;
+    $parts = parse_url($url);
+    if ($parts === false || empty($parts['scheme']) || empty($parts['host'])) {
+        return '';
+    }
+    $path = $parts['path'] ?? '/';
+    $segments = [];
+    foreach (explode('/', $path) as $segment) {
+        if ($segment === '' || $segment === '.') {
+            continue;
+        }
+        if ($segment === '..') {
+            array_pop($segments);
+            continue;
+        }
+        $segments[] = rawurlencode(rawurldecode($segment));
+    }
+    $normalized = strtolower($parts['scheme']) . '://' . strtolower($parts['host']) . '/' . implode('/', $segments);
+    if (str_ends_with($path, '/') && !str_ends_with($normalized, '/')) {
+        $normalized .= '/';
+    }
+    if (!empty($parts['query'])) {
+        $normalized .= '?' . $parts['query'];
+    }
+    return rtrim($normalized, '?');
+}
+
+function fetch_page(string $url): array
+{
+    $headers = [];
+    $body = '';
+    $status = 0;
+    $contentType = '';
+    $lastmod = '';
+
+    if (function_exists('curl_init')) {
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_MAXREDIRS => 5,
+            CURLOPT_TIMEOUT => 12,
+            CURLOPT_USERAGENT => 'SitemapSetupBot/1.0',
+            CURLOPT_HEADERFUNCTION => function ($curl, string $header) use (&$headers): int {
+                $headers[] = trim($header);
+                return strlen($header);
+            },
+        ]);
+        $body = (string)curl_exec($ch);
+        $status = (int)curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+        $contentType = (string)curl_getinfo($ch, CURLINFO_CONTENT_TYPE);
+        curl_close($ch);
+    } else {
+        $context = stream_context_create(['http' => ['timeout' => 12, 'header' => "User-Agent: SitemapSetupBot/1.0\r\n"]]);
+        $body = (string)@file_get_contents($url, false, $context);
+        $headers = $http_response_header ?? [];
+        foreach ($headers as $header) {
+            if (preg_match('~^HTTP/\S+\s+(\d+)~i', $header, $match)) {
+                $status = (int)$match[1];
+            }
+            if (stripos($header, 'Content-Type:') === 0) {
+                $contentType = trim(substr($header, 13));
+            }
+        }
     }
 
-    return $canonical;
+    foreach ($headers as $header) {
+        if (stripos($header, 'Last-Modified:') === 0) {
+            $timestamp = strtotime(trim(substr($header, 14)));
+            if ($timestamp !== false) {
+                $lastmod = date('c', $timestamp);
+            }
+        }
+    }
+
+    return [
+        'ok' => $status >= 200 && $status < 300 && stripos($contentType, 'text/html') !== false,
+        'body' => $body,
+        'lastmod' => $lastmod,
+    ];
+}
+
+function html_field(string $html, string $pattern): string
+{
+    if (!preg_match($pattern, $html, $match)) {
+        return '';
+    }
+    return trim(html_entity_decode(strip_tags($match[1]), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+}
+
+function tag_attribute(string $tag, string $attribute): string
+{
+    if (!preg_match('~\s' . preg_quote($attribute, '~') . '\s*=\s*(["\'])(.*?)\1~i', $tag, $match)) {
+        return '';
+    }
+    return trim(html_entity_decode($match[2], ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+}
+
+function link_href_by_rel(string $html, string $rel): string
+{
+    if (!preg_match_all('~<link\s+[^>]*>~i', $html, $matches)) {
+        return '';
+    }
+    foreach ($matches[0] as $tag) {
+        if (strcasecmp(tag_attribute($tag, 'rel'), $rel) === 0) {
+            return tag_attribute($tag, 'href');
+        }
+    }
+    return '';
+}
+
+function meta_content_by_name(string $html, string $name): string
+{
+    if (!preg_match_all('~<meta\s+[^>]*>~i', $html, $matches)) {
+        return '';
+    }
+    foreach ($matches[0] as $tag) {
+        if (strcasecmp(tag_attribute($tag, 'name'), $name) === 0) {
+            return tag_attribute($tag, 'content');
+        }
+    }
+    return '';
+}
+
+function extract_page_data(string $html, string $url, string $siteUrl): array
+{
+    $canonical = link_href_by_rel($html, 'canonical');
+    $canonical = $canonical === '' ? $url : normalize_crawled_url($canonical, $url);
+    if ($canonical === '' || !same_site_url($canonical, $siteUrl)) {
+        $canonical = $url;
+    }
+
+    preg_match_all('~<a\s+[^>]*href=["\']([^"\']+)["\']~i', $html, $matches);
+    $links = [];
+    foreach ($matches[1] ?? [] as $href) {
+        $link = normalize_crawled_url($href, $url);
+        if ($link !== '' && same_site_url($link, $siteUrl)) {
+            $links[] = $link;
+        }
+    }
+
+    return [
+        'canonical' => $canonical,
+        'title' => html_field($html, '~<title[^>]*>(.*?)</title>~is'),
+        'description' => meta_content_by_name($html, 'description'),
+        'keywords' => meta_content_by_name($html, 'keywords'),
+        'links' => array_values(array_unique($links)),
+    ];
 }
 
 function collect_urls(string $rootDir, string $siteUrl, array $excludes): array
 {
-    $allowedExtensions = ['html', 'htm', 'php'];
-    $internalExcludes = [CONFIG_FILE, basename(__FILE__), SITEMAP_FILE, ROOT_FILE, '.git'];
-    $excludes = array_values(array_unique(array_merge($excludes, $internalExcludes)));
-    $urls = [];
+    unset($rootDir);
+    $startUrl = normalize_crawled_url($siteUrl . '/', $siteUrl);
+    $queue = [$startUrl];
+    $visited = [];
+    $pages = [];
 
-    $iterator = new RecursiveIteratorIterator(
-        new RecursiveCallbackFilterIterator(
-            new RecursiveDirectoryIterator($rootDir, FilesystemIterator::SKIP_DOTS),
-            function (SplFileInfo $file, string $key, RecursiveDirectoryIterator $iterator) use ($rootDir, $excludes): bool {
-                $relative = ltrim(str_replace('\\', '/', substr($file->getPathname(), strlen($rootDir))), '/');
-                if ($file->isDir() && is_excluded($relative, $excludes)) {
-                    return false;
-                }
-                return true;
-            }
-        )
-    );
-
-    foreach ($iterator as $file) {
-        if (!$file instanceof SplFileInfo || !$file->isFile()) {
+    while ($queue !== [] && count($visited) < MAX_SITEMAP_URLS) {
+        $url = array_shift($queue);
+        if ($url === '' || isset($visited[$url])) {
             continue;
         }
-        $relative = ltrim(str_replace('\\', '/', substr($file->getPathname(), strlen($rootDir))), '/');
-        if (is_excluded($relative, $excludes)) {
+        $path = trim((string)(parse_url($url, PHP_URL_PATH) ?? ''), '/');
+        if (is_excluded($path, $excludes)) {
             continue;
         }
-        $extension = strtolower(pathinfo($relative, PATHINFO_EXTENSION));
-        if (!in_array($extension, $allowedExtensions, true)) {
+        $visited[$url] = true;
+        $fetched = fetch_page($url);
+        if (!$fetched['ok']) {
             continue;
         }
 
-        // Do not publish directory-only URLs for application folders. Only the
-        // document-root index becomes the homepage; nested indexes stay as files.
-        $urlPath = preg_match('~^index\.(php|html?)$~i', $relative) ? '' : trim($relative, '/');
-        $location = $siteUrl . ($urlPath === '' ? '/' : '/' . implode('/', array_map('rawurlencode', explode('/', $urlPath))));
-        $location = canonical_url_for_file($file->getPathname(), $location, $siteUrl);
-        $urls[$location] = [
-            'loc' => $location,
-            'lastmod' => date('c', $file->getMTime()),
+        $data = extract_page_data($fetched['body'], $url, $siteUrl);
+        $loc = $data['canonical'];
+        $pages[$loc] = [
+            'loc' => $loc,
+            'lastmod' => $fetched['lastmod'],
+            'title' => $data['title'],
+            'description' => $data['description'],
+            'keywords' => $data['keywords'],
         ];
+
+        foreach ($data['links'] as $link) {
+            $linkPath = trim((string)(parse_url($link, PHP_URL_PATH) ?? ''), '/');
+            if (!isset($visited[$link]) && !is_excluded($linkPath, $excludes)) {
+                $queue[] = $link;
+            }
+        }
+        $queue = array_values(array_unique($queue));
     }
 
-    ksort($urls);
-    if ($urls === []) {
-        $urls[$siteUrl . '/'] = ['loc' => $siteUrl . '/', 'lastmod' => date('c')];
-    }
-    return array_values($urls);
+    ksort($pages);
+    return array_values($pages);
 }
 
 function build_urlset_xml(array $urls): string
@@ -194,9 +327,11 @@ function build_urlset_xml(array $urls): string
         $loc = $xml->createElement('loc');
         $loc->appendChild($xml->createTextNode($item['loc']));
         $url->appendChild($loc);
-        $lastmod = $xml->createElement('lastmod');
-        $lastmod->appendChild($xml->createTextNode($item['lastmod']));
-        $url->appendChild($lastmod);
+        if (!empty($item['lastmod'])) {
+            $lastmod = $xml->createElement('lastmod');
+            $lastmod->appendChild($xml->createTextNode($item['lastmod']));
+            $url->appendChild($lastmod);
+        }
         $urlset->appendChild($url);
     }
 
@@ -279,6 +414,23 @@ function build_sitemap_files(string $siteUrl, array $urls): array
     return [SITEMAP_FILE => build_sitemap_index_xml($indexItems)] + $files;
 }
 
+function clean_report_value(string $value): string
+{
+    return str_replace(["\t", "\r", "\n"], ' ', $value);
+}
+
+function build_seo_report(array $pages): string
+{
+    $lines = ["URL\tTitle\tDescription\tKeywords"];
+    foreach ($pages as $page) {
+        $lines[] = clean_report_value((string)$page['loc']) . "\t"
+            . clean_report_value((string)($page['title'] ?? '')) . "\t"
+            . clean_report_value((string)($page['description'] ?? '')) . "\t"
+            . clean_report_value((string)($page['keywords'] ?? ''));
+    }
+    return implode("\n", $lines) . "\n";
+}
+
 function build_root_txt(string $siteUrl): string
 {
     $aiAgents = [
@@ -325,6 +477,7 @@ function refresh_files(string $rootDir, array $config): array
     }
     $targets = build_sitemap_files($siteUrl, $urls);
     $targets[ROOT_FILE] = build_root_txt($siteUrl);
+    $targets[SEO_REPORT_FILE] = build_seo_report($urls);
 
     $messages = [];
     $errors = [];
@@ -432,7 +585,7 @@ $excludeText = implode("\n", $config['excludes']);
 <body>
 <main>
     <h1>Sitemap & root.txt setup</h1>
-    <p class="help">Put this file in your website <code>/www</code> folder. This page creates or updates <code>sitemap.xml</code> and <code>root.txt</code>. Reopen this page anytime; it auto-updates files when they are older than 12 hours.</p>
+    <p class="help">Put this file in your website <code>/www</code> folder. This page crawls public website pages and creates or updates <code>sitemap.xml</code>, <code>root.txt</code>, and <code>seo-pages.txt</code>. Reopen this page anytime; it auto-updates files when they are older than 12 hours.</p>
     <p class="help"><strong>Security:</strong> after setup, settings are protected by your PIN. Keep this filename hard to guess or remove it if you do not need browser-based updates.</p>
 
     <?php foreach ($messages as $message): ?>
