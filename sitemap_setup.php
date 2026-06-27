@@ -611,9 +611,9 @@ $excludeText = implode("\n", $config['excludes']);
         <input id="admin_pin" name="admin_pin" type="password" <?= $isConfigured ? '' : 'required minlength="6"' ?>>
         <p class="help">Needed before anyone can change these settings later.</p>
 
-        <label for="excludes">Exclude website URL paths</label>
-        <textarea id="excludes" name="excludes" placeholder="admin&#10;private&#10;cache&#10;*?preview=*"><?= h($excludeText) ?></textarea>
-        <p class="help">One URL path or pattern per line. Examples: <code>admin</code>, <code>private/page</code>, <code>cache</code>, <code>*?preview=*</code>.</p>
+        <label for="excludes">Exclude URL</label>
+        <textarea id="excludes" name="excludes" placeholder="/admin&#10;/private&#10;/cache&#10;*?preview=*"><?= h($excludeText) ?></textarea>
+        <p class="help">One URL or URL pattern per line. Examples: <code>/admin</code>, <code>/private/page</code>, <code>/cache</code>, <code>*?preview=*</code>.</p>
 
         <button type="submit">Save settings and update now</button>
     </form>
