@@ -13,6 +13,7 @@ const CONFIG_FILE = '.sitemap_setup_config.php';
 const SITEMAP_FILE = 'sitemap.xml';
 const ROOT_FILE = 'root.txt';
 const REFRESH_SECONDS = 43200; // 12 hours
+const MAX_SITEMAP_URLS = 50000; // Google sitemap limit
 
 $rootDir = realpath(__DIR__) ?: __DIR__;
 $configPath = $rootDir . DIRECTORY_SEPARATOR . CONFIG_FILE;
@@ -124,8 +125,9 @@ function collect_urls(string $rootDir, string $siteUrl, array $excludes): array
             continue;
         }
 
-        $urlPath = preg_replace('~(^|/)index\.(php|html?)$~i', '$1', $relative) ?? $relative;
-        $urlPath = trim($urlPath, '/');
+        // Do not publish directory-only URLs for application folders. Only the
+        // document-root index becomes the homepage; nested indexes stay as files.
+        $urlPath = preg_match('~^index\.(php|html?)$~i', $relative) ? '' : trim($relative, '/');
         $location = $siteUrl . ($urlPath === '' ? '/' : '/' . implode('/', array_map('rawurlencode', explode('/', $urlPath))));
         $urls[$location] = [
             'loc' => $location,
@@ -134,6 +136,7 @@ function collect_urls(string $rootDir, string $siteUrl, array $excludes): array
     }
 
     ksort($urls);
+    $urls = array_slice($urls, 0, MAX_SITEMAP_URLS, true);
     if ($urls === []) {
         $urls[$siteUrl . '/'] = ['loc' => $siteUrl . '/', 'lastmod' => date('c')];
     }
@@ -150,8 +153,12 @@ function build_sitemap(array $urls): string
 
     foreach ($urls as $item) {
         $url = $xml->createElement('url');
-        $url->appendChild($xml->createElement('loc', $item['loc']));
-        $url->appendChild($xml->createElement('lastmod', $item['lastmod']));
+        $loc = $xml->createElement('loc');
+        $loc->appendChild($xml->createTextNode($item['loc']));
+        $url->appendChild($loc);
+        $lastmod = $xml->createElement('lastmod');
+        $lastmod->appendChild($xml->createTextNode($item['lastmod']));
+        $url->appendChild($lastmod);
         $urlset->appendChild($url);
     }
 
@@ -160,7 +167,33 @@ function build_sitemap(array $urls): string
 
 function build_root_txt(string $siteUrl): string
 {
-    return "User-agent: *\nAllow: /\n\nSitemap: " . $siteUrl . '/' . SITEMAP_FILE . "\n";
+    $aiAgents = [
+        'GPTBot',
+        'ChatGPT-User',
+        'OAI-SearchBot',
+        'ClaudeBot',
+        'Claude-User',
+        'PerplexityBot',
+        'Google-Extended',
+        'CCBot',
+        'anthropic-ai',
+        'Applebot-Extended',
+    ];
+
+    $lines = [
+        'User-agent: *',
+        'Allow: /',
+        '',
+        '# Explicitly allow common AI agents.',
+    ];
+    foreach ($aiAgents as $agent) {
+        $lines[] = 'User-agent: ' . $agent;
+        $lines[] = 'Allow: /';
+        $lines[] = '';
+    }
+    $lines[] = 'Sitemap: ' . $siteUrl . '/' . SITEMAP_FILE;
+
+    return implode("\n", $lines) . "\n";
 }
 
 function refresh_files(string $rootDir, array $config): array
@@ -199,7 +232,7 @@ if (!isset($config['site_url'])) {
     $config['site_url'] = default_site_url();
 }
 if (!isset($config['excludes']) || !is_array($config['excludes'])) {
-    $config['excludes'] = ['admin', 'private', 'vendor', 'node_modules', 'cache', 'tmp', '*.bak'];
+    $config['excludes'] = ['admin', 'private', 'app', 'application', 'system', 'storage', 'vendor', 'node_modules', 'cache', 'tmp', 'logs', '*.bak'];
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['login_pin'])) {
