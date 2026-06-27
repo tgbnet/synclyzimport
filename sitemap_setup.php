@@ -268,9 +268,8 @@ function extract_page_data(string $html, string $url, string $siteUrl): array
     ];
 }
 
-function collect_urls(string $rootDir, string $siteUrl, array $excludes): array
+function collect_urls(string $siteUrl, array $excludes): array
 {
-    unset($rootDir);
     $startUrl = normalize_crawled_url($siteUrl . '/', $siteUrl);
     $queue = [$startUrl];
     $visited = [];
@@ -469,7 +468,7 @@ function refresh_files(string $rootDir, array $config): array
         return ['ok' => false, 'messages' => [], 'errors' => ['Please set the website domain first.']];
     }
 
-    $urls = collect_urls($rootDir, $siteUrl, $config['excludes'] ?? []);
+    $urls = collect_urls($siteUrl, $config['excludes'] ?? []);
     foreach (glob($rootDir . DIRECTORY_SEPARATOR . SITEMAP_PART_PREFIX . '*.xml') ?: [] as $oldPart) {
         if (is_file($oldPart) && is_writable($oldPart)) {
             unlink($oldPart);
@@ -484,7 +483,7 @@ function refresh_files(string $rootDir, array $config): array
     foreach ($targets as $file => $contents) {
         $path = $rootDir . DIRECTORY_SEPARATOR . $file;
         if ((file_exists($path) && !is_writable($path)) || (!file_exists($path) && !is_writable($rootDir))) {
-            $errors[] = $file . ' cannot be written. Please give PHP write permission for this file or the /www folder.';
+            $errors[] = $file . ' cannot be written. Please give PHP write permission for this generated file or the /www folder.';
             continue;
         }
         if (file_put_contents($path, $contents, LOCK_EX) === false) {
@@ -545,7 +544,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['site_url']) && $isAut
 } elseif (is_file($configPath)) {
     $sitemapPath = $rootDir . DIRECTORY_SEPARATOR . SITEMAP_FILE;
     $rootPath = $rootDir . DIRECTORY_SEPARATOR . ROOT_FILE;
-    $needsRefresh = !is_file($sitemapPath) || !is_file($rootPath) || filemtime($sitemapPath) < (time() - REFRESH_SECONDS) || filemtime($rootPath) < (time() - REFRESH_SECONDS);
+    $seoPath = $rootDir . DIRECTORY_SEPARATOR . SEO_REPORT_FILE;
+    $needsRefresh = !is_file($sitemapPath) || !is_file($rootPath) || !is_file($seoPath) || filemtime($sitemapPath) < (time() - REFRESH_SECONDS) || filemtime($rootPath) < (time() - REFRESH_SECONDS) || filemtime($seoPath) < (time() - REFRESH_SECONDS);
     if ($needsRefresh) {
         $result = refresh_files($rootDir, $config);
         $messages = array_merge($messages, $result['messages']);
@@ -611,9 +611,9 @@ $excludeText = implode("\n", $config['excludes']);
         <input id="admin_pin" name="admin_pin" type="password" <?= $isConfigured ? '' : 'required minlength="6"' ?>>
         <p class="help">Needed before anyone can change these settings later.</p>
 
-        <label for="excludes">Exclude files or folders</label>
-        <textarea id="excludes" name="excludes" placeholder="admin&#10;private&#10;cache&#10;*.bak"><?= h($excludeText) ?></textarea>
-        <p class="help">One item per line. Examples: <code>admin</code>, <code>private/file.php</code>, <code>cache</code>, <code>*.bak</code>.</p>
+        <label for="excludes">Exclude website URL paths</label>
+        <textarea id="excludes" name="excludes" placeholder="admin&#10;private&#10;cache&#10;*?preview=*"><?= h($excludeText) ?></textarea>
+        <p class="help">One URL path or pattern per line. Examples: <code>admin</code>, <code>private/page</code>, <code>cache</code>, <code>*?preview=*</code>.</p>
 
         <button type="submit">Save settings and update now</button>
     </form>
