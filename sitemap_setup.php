@@ -14,6 +14,8 @@ const SITEMAP_FILE = 'sitemap.xml';
 const ROOT_FILE = 'root.txt';
 const REFRESH_SECONDS = 43200; // 12 hours
 const MAX_SITEMAP_URLS = 50000; // Google sitemap limit
+const MAX_SITEMAP_BYTES = 52428800; // 50MB uncompressed Google sitemap limit
+const SITEMAP_PART_PREFIX = 'sitemap-part-';
 
 $rootDir = realpath(__DIR__) ?: __DIR__;
 $configPath = $rootDir . DIRECTORY_SEPARATOR . CONFIG_FILE;
@@ -92,6 +94,42 @@ function is_excluded(string $relativePath, array $excludes): bool
     return false;
 }
 
+function same_site_url(string $url, string $siteUrl): bool
+{
+    $urlHost = strtolower((string)(parse_url($url, PHP_URL_HOST) ?? ''));
+    $siteHost = strtolower((string)(parse_url($siteUrl, PHP_URL_HOST) ?? ''));
+    return $urlHost !== '' && $siteHost !== '' && $urlHost === $siteHost;
+}
+
+function canonical_url_for_file(string $filePath, string $fallbackUrl, string $siteUrl): string
+{
+    $extension = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
+    if (!in_array($extension, ['html', 'htm', 'php'], true) || !is_readable($filePath)) {
+        return $fallbackUrl;
+    }
+
+    $handle = fopen($filePath, 'rb');
+    if ($handle === false) {
+        return $fallbackUrl;
+    }
+    $html = fread($handle, 262144) ?: '';
+    fclose($handle);
+
+    if (!preg_match('~<link\s+[^>]*rel=["\']?canonical["\']?[^>]*>~i', $html, $tag)) {
+        return $fallbackUrl;
+    }
+    if (!preg_match('~href=["\']([^"\']+)["\']~i', $tag[0], $href)) {
+        return $fallbackUrl;
+    }
+
+    $canonical = html_entity_decode(trim($href[1]), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+    if ($canonical === '' || !preg_match('~^https?://~i', $canonical) || !same_site_url($canonical, $siteUrl)) {
+        return $fallbackUrl;
+    }
+
+    return $canonical;
+}
+
 function collect_urls(string $rootDir, string $siteUrl, array $excludes): array
 {
     $allowedExtensions = ['html', 'htm', 'php'];
@@ -129,6 +167,7 @@ function collect_urls(string $rootDir, string $siteUrl, array $excludes): array
         // document-root index becomes the homepage; nested indexes stay as files.
         $urlPath = preg_match('~^index\.(php|html?)$~i', $relative) ? '' : trim($relative, '/');
         $location = $siteUrl . ($urlPath === '' ? '/' : '/' . implode('/', array_map('rawurlencode', explode('/', $urlPath))));
+        $location = canonical_url_for_file($file->getPathname(), $location, $siteUrl);
         $urls[$location] = [
             'loc' => $location,
             'lastmod' => date('c', $file->getMTime()),
@@ -136,14 +175,13 @@ function collect_urls(string $rootDir, string $siteUrl, array $excludes): array
     }
 
     ksort($urls);
-    $urls = array_slice($urls, 0, MAX_SITEMAP_URLS, true);
     if ($urls === []) {
         $urls[$siteUrl . '/'] = ['loc' => $siteUrl . '/', 'lastmod' => date('c')];
     }
     return array_values($urls);
 }
 
-function build_sitemap(array $urls): string
+function build_urlset_xml(array $urls): string
 {
     $xml = new DOMDocument('1.0', 'UTF-8');
     $xml->formatOutput = true;
@@ -163,6 +201,82 @@ function build_sitemap(array $urls): string
     }
 
     return (string)$xml->saveXML();
+}
+
+function build_sitemap_index_xml(array $sitemaps): string
+{
+    $xml = new DOMDocument('1.0', 'UTF-8');
+    $xml->formatOutput = true;
+    $index = $xml->createElement('sitemapindex');
+    $index->setAttribute('xmlns', 'http://www.sitemaps.org/schemas/sitemap/0.9');
+    $xml->appendChild($index);
+
+    foreach ($sitemaps as $item) {
+        $sitemap = $xml->createElement('sitemap');
+        $loc = $xml->createElement('loc');
+        $loc->appendChild($xml->createTextNode($item['loc']));
+        $sitemap->appendChild($loc);
+        $lastmod = $xml->createElement('lastmod');
+        $lastmod->appendChild($xml->createTextNode($item['lastmod']));
+        $sitemap->appendChild($lastmod);
+        $index->appendChild($sitemap);
+    }
+
+    return (string)$xml->saveXML();
+}
+
+function estimated_sitemap_entry_bytes(array $url): int
+{
+    $loc = htmlspecialchars((string)$url['loc'], ENT_XML1 | ENT_COMPAT, 'UTF-8');
+    $lastmod = htmlspecialchars((string)$url['lastmod'], ENT_XML1 | ENT_COMPAT, 'UTF-8');
+    return strlen("  <url>
+    <loc>{$loc}</loc>
+    <lastmod>{$lastmod}</lastmod>
+  </url>
+");
+}
+
+function sitemap_chunks(array $urls): array
+{
+    $chunks = [];
+    $chunk = [];
+    $chunkBytes = 120; // XML declaration plus urlset wrapper.
+
+    foreach ($urls as $url) {
+        $entryBytes = estimated_sitemap_entry_bytes($url);
+        if ($chunk !== [] && (count($chunk) >= MAX_SITEMAP_URLS || ($chunkBytes + $entryBytes) > MAX_SITEMAP_BYTES)) {
+            $chunks[] = $chunk;
+            $chunk = [];
+            $chunkBytes = 120;
+        }
+        $chunk[] = $url;
+        $chunkBytes += $entryBytes;
+    }
+
+    if ($chunk !== []) {
+        $chunks[] = $chunk;
+    }
+    return $chunks;
+}
+
+function build_sitemap_files(string $siteUrl, array $urls): array
+{
+    $chunks = sitemap_chunks($urls);
+    if (count($chunks) <= 1) {
+        return [SITEMAP_FILE => build_urlset_xml($chunks[0] ?? [])];
+    }
+
+    $files = [];
+    $indexItems = [];
+    foreach ($chunks as $index => $chunk) {
+        $filename = SITEMAP_PART_PREFIX . ($index + 1) . '.xml';
+        $files[$filename] = build_urlset_xml($chunk);
+        $indexItems[] = [
+            'loc' => $siteUrl . '/' . $filename,
+            'lastmod' => date('c'),
+        ];
+    }
+    return [SITEMAP_FILE => build_sitemap_index_xml($indexItems)] + $files;
 }
 
 function build_root_txt(string $siteUrl): string
@@ -204,10 +318,13 @@ function refresh_files(string $rootDir, array $config): array
     }
 
     $urls = collect_urls($rootDir, $siteUrl, $config['excludes'] ?? []);
-    $targets = [
-        SITEMAP_FILE => build_sitemap($urls),
-        ROOT_FILE => build_root_txt($siteUrl),
-    ];
+    foreach (glob($rootDir . DIRECTORY_SEPARATOR . SITEMAP_PART_PREFIX . '*.xml') ?: [] as $oldPart) {
+        if (is_file($oldPart) && is_writable($oldPart)) {
+            unlink($oldPart);
+        }
+    }
+    $targets = build_sitemap_files($siteUrl, $urls);
+    $targets[ROOT_FILE] = build_root_txt($siteUrl);
 
     $messages = [];
     $errors = [];
